@@ -5,10 +5,23 @@
 # Python generated files
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Environment variables and secrets
 .env
 .env.*
-
-# Keep an example environment template if we add one later
 !.env.example
+
+# Log files
+*.log
+
+# macOS metadata
+.DS_Store
+
+
+storage/
