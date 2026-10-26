@@ -1,0 +1,14 @@
+
+# Python virtual environment
+.venv/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Environment variables and secrets
+.env
+.env.*
+
+# Keep an example environment template if we add one later
+!.env.example
