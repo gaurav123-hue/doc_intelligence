@@ -2,6 +2,7 @@
 """API routes for uploading and listing documents."""
 
 import hashlib
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -14,10 +15,14 @@ from backend.database import (
     get_document_by_hash,
     get_documents,
 )
+from backend.services.document_processing import process_document
+
+# Keep detailed processing errors in server logs, not API responses.
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
-# Keep uploaded files outside the source-code directories.
+# Store uploaded files outside the source-code directories.
 STORAGE_DIR = Path("storage/documents")
 
 # Enforce a 10 MiB upload limit and allow only supported extensions.
@@ -55,7 +60,7 @@ def list_documents():
     status_code=status.HTTP_201_CREATED,
 )
 async def upload_document(file: UploadFile = File(...)):
-    """Validate, store, and register a document while rejecting duplicates."""
+    """Validate, store, register, and process an uploaded document."""
 
     try:
         # Strip any client-supplied directory components from the filename.
@@ -68,7 +73,7 @@ async def upload_document(file: UploadFile = File(...)):
                 detail="Only PDF, TXT, and DOCX files are allowed",
             )
 
-        # Read only one byte beyond the limit so oversized uploads are detected.
+        # Read only one byte beyond the limit to detect oversized uploads.
         content = await file.read(MAX_FILE_SIZE + 1)
 
         if not content:
@@ -83,12 +88,12 @@ async def upload_document(file: UploadFile = File(...)):
                 detail="The file exceeds the 10 MB limit",
             )
 
-        # Hash the file bytes so identical content is detected despite different names.
+        # Hash the bytes so identical content is detected despite different names.
         content_hash = hashlib.sha256(content).hexdigest()
         file_type = extension.lstrip(".").upper()
 
         try:
-            # Check existing records before attempting to store a new document.
+            # Check for an existing document before storing a new file.
             existing = get_document_by_hash(content_hash)
         except Exception as exc:
             raise HTTPException(
@@ -105,62 +110,102 @@ async def upload_document(file: UploadFile = File(...)):
                 ),
             )
 
-        # Use a content-derived path so each distinct file has a stable name.
+        # Give each distinct file a stable, content-derived storage path.
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         destination = STORAGE_DIR / f"{content_hash}{extension}"
 
-        # Track whether this request created the file. Only that request may
-        # remove it during cleanup; never delete a pre-existing file.
+        # Only remove the file if this request successfully created it.
         created_file = False
 
         try:
-            # Exclusive creation prevents overwriting a file created by another request.
+            # Exclusive creation prevents overwriting an existing file.
             with destination.open("xb") as stored_file:
                 created_file = True
                 stored_file.write(content)
 
         except FileExistsError as exc:
-            # The same content may be in storage already, even if its database
-            # record is not yet visible. Preserve the existing file.
+            # Preserve a file that may belong to another concurrent upload.
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="A file with identical content already exists or is being uploaded",
+                detail=(
+                    "A file with identical content already exists "
+                    "or is being uploaded"
+                ),
             ) from exc
 
         try:
-            # The database's unique content-hash index is the final duplicate safeguard.
-            return create_uploaded_document(
+            # Create metadata before processing so failures can be tracked.
+            document = create_uploaded_document(
                 filename=filename,
                 file_type=file_type,
                 content_hash=content_hash,
             )
 
         except UniqueViolation as exc:
-            # Remove only the file created by this request after a duplicate insert.
+            # The database unique index protects against concurrent duplicates.
             if created_file:
-                destination.unlink(missing_ok=True)
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    # Log cleanup failures without masking the database error.
+                    logger.exception(
+                        "Could not remove uploaded file after duplicate insertion: %s",
+                        destination,
+                    )
 
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A document with identical content already exists",
             ) from exc
 
-        except Exception:
-            # Avoid leaving our newly created file behind if database insertion fails.
+        except Exception as exc:
+            # Avoid leaving an orphaned file if metadata insertion fails.
             if created_file:
-                destination.unlink(missing_ok=True)
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    # Preserve the original error and log the cleanup problem.
+                    logger.exception(
+                        "Could not remove uploaded file after metadata insertion failed: %s",
+                        destination,
+                    )
 
-            raise
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to save uploaded document",
+            ) from exc
+
+        try:
+            # Extract text, persist it, and mark the document as processed.
+            process_document(document["id"], destination)
+
+            # Reflect successful processing in the response.
+            document["status"] = "processed"
+
+        except Exception:
+            # Preserve the file and metadata so the failed document can be retried.
+            logger.exception(
+                "Processing failed for document ID %s",
+                document["id"],
+            )
+
+            # The processing service attempts to record failure status in the database.
+            document["status"] = "failed"
+
+        # The upload succeeded even if subsequent text processing failed.
+        return document
 
     except HTTPException:
-        # Preserve deliberate client errors such as 400, 409, and 413.
+        # Preserve intentional client errors such as 400, 409, and 413.
         raise
+
     except Exception as exc:
         # Keep unexpected internal details out of the API response.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to save uploaded document",
         ) from exc
+
     finally:
-        # Release the uploaded-file resource on success and every failure path.
+        # Release the uploaded-file resource on every success or failure path.
         await file.close()

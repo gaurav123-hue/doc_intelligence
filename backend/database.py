@@ -138,3 +138,45 @@ def create_uploaded_document(
         "status": row[3],
         "created_at": row[4],
     }
+
+
+
+def save_extracted_text(document_id: int, extracted_text: str) -> None:
+    """Save extracted text for a document, inserting or updating its content."""
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                # Upsert makes retries safe if this document already has content.
+                cursor.execute(
+                    """
+                    INSERT INTO document_contents (document_id, extracted_text)
+                    VALUES (%s, %s)
+                    ON CONFLICT (document_id)
+                    DO UPDATE SET
+                        extracted_text = EXCLUDED.extracted_text,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (document_id, extracted_text),
+                )
+
+
+def update_document_status(document_id: int, status: str) -> None:
+    """Update processing status for an existing document."""
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                # Parameterize values to keep SQL safe from injection.
+                cursor.execute(
+                    """
+                    UPDATE documents
+                    SET status = %s
+                    WHERE id = %s
+                    """,
+                    (status, document_id),
+                )
+
+                # Fail explicitly if the requested document doesn't exist.
+                if cursor.rowcount == 0:
+                    raise ValueError(
+                        f"Document with ID {document_id} does not exist"
+                    )
