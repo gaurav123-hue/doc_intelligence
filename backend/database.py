@@ -180,3 +180,45 @@ def update_document_status(document_id: int, status: str) -> None:
                     raise ValueError(
                         f"Document with ID {document_id} does not exist"
                     )
+
+
+def save_document_chunks(document_id: int, chunks: list[str]) -> None:
+    """Replace a document's stored chunks in a single database transaction."""
+
+    # Reject empty input before connecting, so existing chunks are not deleted accidentally.
+    if not chunks:
+        raise ValueError("at least one chunk is required")
+
+    # Reject blank chunks before making any database changes.
+    if any(not chunk.strip() for chunk in chunks):
+        raise ValueError("chunks must not be empty or whitespace-only")
+
+    # Open a connection that will be closed even if the operation fails.
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        # The connection context commits on success and rolls back on error.
+        with connection:
+            with connection.cursor() as cursor:
+                # Remove previous chunks as part of the same transaction.
+                cursor.execute(
+                    """
+                    DELETE FROM document_chunks
+                    WHERE document_id = %s
+                    """,
+                    (document_id,),
+                )
+
+                # Assign each chunk a stable, zero-based position.
+                chunk_rows = [
+                    (document_id, index, chunk.strip())
+                    for index, chunk in enumerate(chunks)
+                ]
+
+                # Insert the replacement chunks efficiently in one operation.
+                cursor.executemany(
+                    """
+                    INSERT INTO document_chunks
+                        (document_id, chunk_index, chunk_text)
+                    VALUES (%s, %s, %s)
+                    """,
+                    chunk_rows,
+                )
