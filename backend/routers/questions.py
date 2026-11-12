@@ -1,61 +1,110 @@
 
-"""API endpoints for asking questions about uploaded documents."""
+"""API routes for submitting questions about uploaded documents."""
 
-from fastapi import APIRouter
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-# Reuse the existing embedding and vector-search implementations.
-from backend.database import search_similar_chunks
-from backend.services.embedding import generate_embedding
-
-# Import the RAG orchestration function for document-based answers.
+from backend.database import (
+    get_conversation_history,
+    save_conversation_turn,
+)
 from backend.services.rag import answer_question
+from backend.services.sessions import get_authenticated_session
 
-router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# The /questions prefix is added in backend/main.py.
+router = APIRouter(tags=["Questions"])
 
 
 class QuestionRequest(BaseModel):
-    """Validate the question submitted by the client."""
+    """Validate questions submitted by the client."""
 
-    question: str = Field(min_length=3, max_length=2000)
+    question: str = Field(
+        min_length=3,
+        max_length=2000,
+        description="Question to ask about uploaded documents",
+    )
 
 
 @router.post("/preview")
-def preview_question(request: QuestionRequest):
-    """Confirm that a question was received."""
+def preview_question(
+    request: QuestionRequest,
+    session: dict = Depends(get_authenticated_session),
+):
+    """Preview a question after verifying the active session."""
 
     return {
         "received_question": request.question,
+        "session_id": session["id"],
         "message": "Question received successfully",
     }
 
 
-@router.post("/search")
-def search_question(request: QuestionRequest):
-    """Find document chunks semantically related to a question."""
-
-    # Convert the user's question into the same vector space as stored chunks.
-    query_embedding = generate_embedding(request.question)
-
-    # Retrieve the five closest matching chunks from PostgreSQL using pgvector.
-    results = search_similar_chunks(query_embedding, limit=5)
-
-    # Return the original question and source text for inspection.
-    return {
-        "question": request.question,
-        "results_count": len(results),
-        "results": results,
-    }
-
-
-
 @router.post("/ask")
-def ask_question(request: QuestionRequest):
-    """Answer a question using retrieved document context and the Groq LLM."""
+def ask_question(
+    request: QuestionRequest,
+    session: dict = Depends(get_authenticated_session),
+):
+    """Generate an answer and persist the conversation."""
 
-    # Run the complete RAG pipeline: embedding, retrieval, prompt construction,
-    # and language model response generation.
-    result = answer_question(request.question, limit=5)
+    try:
+        # Generate an answer using documents from the authenticated session.
+        result = answer_question(
+            request.question,
+            session_id=session["id"],
+        )
 
-    # Return the generated answer along with its supporting source references.
-    return result
+        # Save the completed question, answer, and citation metadata.
+        conversation = save_conversation_turn(
+            session_id=session["id"],
+            question=result["question"],
+            answer=result["answer"],
+            sources=result["sources"],
+            cited_source_details=result["cited_source_details"],
+            citation_validation=result["citation_validation"],
+            result_count=result["result_count"],
+        )
+
+        # Include the persistent conversation ID and timestamp in the response.
+        result["conversation_id"] = conversation["id"]
+        result["created_at"] = conversation["created_at"]
+
+        return result
+
+    except Exception:
+        # Log technical details without exposing them to the API client.
+        logger.exception("Failed to generate or save conversation")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to process your question at this time.",
+        )
+
+
+@router.get("/history")
+def get_question_history(
+    session: dict = Depends(get_authenticated_session),
+):
+    """Retrieve conversation history belonging to the active session."""
+
+    try:
+        # Fetch only conversations associated with the authenticated session.
+        history = get_conversation_history(session["id"])
+
+        # Return the records and their total count.
+        return {
+            "history": history,
+            "count": len(history),
+        }
+
+    except Exception:
+        # Keep internal database errors out of the API response.
+        logger.exception("Failed to retrieve conversation history")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to retrieve conversation history at this time.",
+        )

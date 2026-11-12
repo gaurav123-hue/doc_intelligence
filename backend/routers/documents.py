@@ -1,21 +1,31 @@
 
-"""API routes for uploading and listing documents."""
+"""API routes for uploading and listing session-specific documents."""
 
 import hashlib
 import logging
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from psycopg.errors import UniqueViolation
 from pydantic import BaseModel
 
 from backend.database import (
+    SessionDocumentLimitExceeded,
     create_uploaded_document,
     get_document_by_hash,
     get_documents,
 )
 from backend.services.document_processing import process_document
+from backend.services.sessions import get_authenticated_session
+
 
 # Keep detailed processing errors in server logs, not API responses.
 logger = logging.getLogger(__name__)
@@ -25,7 +35,7 @@ router = APIRouter(prefix="/documents", tags=["Documents"])
 # Store uploaded files outside the source-code directories.
 STORAGE_DIR = Path("storage/documents")
 
-# Enforce a 10 MiB upload limit and allow only supported extensions.
+# Enforce a 10 MiB upload limit and allow supported extensions only.
 MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx"}
 
@@ -41,13 +51,20 @@ class DocumentResponse(BaseModel):
 
 
 @router.get("", response_model=list[DocumentResponse])
-def list_documents():
-    """Return document records ordered by database ID."""
+def list_documents(
+    session: dict = Depends(get_authenticated_session),
+):
+    """Return only documents belonging to the authenticated session."""
 
     try:
-        return get_documents()
+        return get_documents(session["id"])
+
     except Exception as exc:
-        # Avoid exposing database credentials or internal errors to clients.
+        logger.exception(
+            "Failed to retrieve documents for session ID %s",
+            session["id"],
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve documents",
@@ -59,8 +76,14 @@ def list_documents():
     response_model=DocumentResponse,
     status_code=status.HTTP_201_CREATED,
 )
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    session: dict = Depends(get_authenticated_session),
+):
     """Validate, store, register, and process an uploaded document."""
+
+    created_file = False
+    destination = None
 
     try:
         # Strip any client-supplied directory components from the filename.
@@ -92,14 +115,11 @@ async def upload_document(file: UploadFile = File(...)):
         content_hash = hashlib.sha256(content).hexdigest()
         file_type = extension.lstrip(".").upper()
 
-        try:
-            # Check for an existing document before storing a new file.
-            existing = get_document_by_hash(content_hash)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to check for duplicate documents",
-            ) from exc
+        # Check for an existing document within this session.
+        existing = get_document_by_hash(
+            content_hash,
+            session["id"],
+        )
 
         if existing:
             raise HTTPException(
@@ -110,21 +130,19 @@ async def upload_document(file: UploadFile = File(...)):
                 ),
             )
 
-        # Give each distinct file a stable, content-derived storage path.
-        STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-        destination = STORAGE_DIR / f"{content_hash}{extension}"
+        # Keep each session's uploaded files in a separate directory.
+        session_storage_dir = STORAGE_DIR / str(session["id"])
+        session_storage_dir.mkdir(parents=True, exist_ok=True)
 
-        # Only remove the file if this request successfully created it.
-        created_file = False
+        destination = session_storage_dir / f"{content_hash}{extension}"
 
+        # Store the file without overwriting an existing file.
         try:
-            # Exclusive creation prevents overwriting an existing file.
             with destination.open("xb") as stored_file:
                 created_file = True
                 stored_file.write(content)
 
         except FileExistsError as exc:
-            # Preserve a file that may belong to another concurrent upload.
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
@@ -133,79 +151,69 @@ async def upload_document(file: UploadFile = File(...)):
                 ),
             ) from exc
 
+        # Register the document and enforce the three-file session limit.
         try:
-            # Create metadata before processing so failures can be tracked.
             document = create_uploaded_document(
                 filename=filename,
                 file_type=file_type,
                 content_hash=content_hash,
+                session_id=session["id"],
             )
 
-        except UniqueViolation as exc:
-            # The database unique index protects against concurrent duplicates.
-            if created_file:
-                try:
-                    destination.unlink(missing_ok=True)
-                except OSError:
-                    # Log cleanup failures without masking the database error.
-                    logger.exception(
-                        "Could not remove uploaded file after duplicate insertion: %s",
-                        destination,
-                    )
+        except SessionDocumentLimitExceeded as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
 
+        except UniqueViolation as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A document with identical content already exists",
             ) from exc
 
-        except Exception as exc:
-            # Avoid leaving an orphaned file if metadata insertion fails.
-            if created_file:
-                try:
-                    destination.unlink(missing_ok=True)
-                except OSError:
-                    # Preserve the original error and log the cleanup problem.
-                    logger.exception(
-                        "Could not remove uploaded file after metadata insertion failed: %s",
-                        destination,
-                    )
-
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to save uploaded document",
-            ) from exc
-
+        # Extract text, persist it, and mark the document as processed.
         try:
-            # Extract text, persist it, and mark the document as processed.
             process_document(document["id"], destination)
-
-            # Reflect successful processing in the response.
             document["status"] = "processed"
 
         except Exception:
-            # Preserve the file and metadata so the failed document can be retried.
+            # Preserve metadata and the uploaded file for possible retry.
             logger.exception(
                 "Processing failed for document ID %s",
                 document["id"],
             )
-
-            # The processing service attempts to record failure status in the database.
             document["status"] = "failed"
 
-        # The upload succeeded even if subsequent text processing failed.
+        # Return document metadata, even if text processing failed.
         return document
 
     except HTTPException:
-        # Preserve intentional client errors such as 400, 409, and 413.
         raise
 
     except Exception as exc:
-        # Keep unexpected internal details out of the API response.
+        logger.exception(
+            "Unexpected upload failure for session ID %s",
+            session["id"],
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to save uploaded document",
         ) from exc
 
     finally:
-        # Release the uploaded-file resource on every success or failure path.
+        # Remove a newly created file if database registration never succeeded.
+        # Once registered, preserve the file even if processing fails.
+        if created_file and destination is not None:
+            if "document" not in locals():
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    logger.exception(
+                        "Could not remove unregistered upload: %s",
+                        destination,
+                    )
+
+        # Release the uploaded-file resource on every execution path.
         await file.close()

@@ -1,14 +1,48 @@
 
-"""Tests for document upload validation, duplicate detection, and processing."""
+"""Tests for session-aware document upload validation and processing."""
 
+import pytest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from backend.main import app
+from backend.services.sessions import get_authenticated_session
 
-# Use FastAPI's test client to exercise routes without starting a live server.
+
+# Use FastAPI's test client without starting a live server.
 client = TestClient(app)
+
+# Provide a consistent authenticated session for upload tests.
+TEST_SESSION = {
+    "id": 999,
+    "created_at": "2026-01-01T10:00:00",
+    "last_activity_at": "2026-01-01T10:00:00",
+}
+
+
+@pytest.fixture(autouse=True)
+def authenticate_test_session():
+    """Override session authentication for every test in this module."""
+
+    app.dependency_overrides[get_authenticated_session] = (
+        lambda: TEST_SESSION
+    )
+
+    yield
+
+    # Remove the override so it cannot affect other test modules.
+    app.dependency_overrides.pop(get_authenticated_session, None)
+
+
+def get_stored_files(storage_path):
+    """Return all physical files, including files in session directories."""
+
+    return [
+        path
+        for path in storage_path.rglob("*")
+        if path.is_file()
+    ]
 
 
 @patch("backend.routers.documents.process_document")
@@ -23,13 +57,13 @@ def test_upload_success(
 ):
     """A valid upload should save the file and process its contents."""
 
-    # Keep this test isolated from real application storage.
-    monkeypatch.setattr("backend.routers.documents.STORAGE_DIR", tmp_path)
+    monkeypatch.setattr(
+        "backend.routers.documents.STORAGE_DIR",
+        tmp_path,
+    )
 
-    # Simulate content that has not previously been uploaded.
     mock_get_by_hash.return_value = None
 
-    # Simulate a successful metadata insertion.
     mock_create.return_value = {
         "id": 100,
         "filename": "test.txt",
@@ -49,18 +83,21 @@ def test_upload_success(
         },
     )
 
-    # The route should return created metadata with the final processing status.
     assert response.status_code == 201
     assert response.json()["filename"] == "test.txt"
     assert response.json()["status"] == "processed"
 
-    # Confirm metadata creation and document processing were each attempted once.
+    mock_get_by_hash.assert_called_once_with(
+        mock_get_by_hash.call_args.args[0],
+        TEST_SESSION["id"],
+    )
     mock_create.assert_called_once()
     mock_process.assert_called_once()
 
-    # Verify the uploaded bytes were stored without modification.
-    stored_files = list(tmp_path.iterdir())
+    stored_files = get_stored_files(tmp_path)
+
     assert len(stored_files) == 1
+    assert stored_files[0].parent.name == str(TEST_SESSION["id"])
     assert stored_files[0].read_bytes() == b"sample document content"
 
 
@@ -76,11 +113,13 @@ def test_upload_keeps_file_when_processing_fails(
 ):
     """A processing failure should preserve the file and metadata."""
 
-    # Use temporary storage to avoid affecting real uploaded documents.
-    monkeypatch.setattr("backend.routers.documents.STORAGE_DIR", tmp_path)
+    monkeypatch.setattr(
+        "backend.routers.documents.STORAGE_DIR",
+        tmp_path,
+    )
 
-    # Simulate a new document whose metadata is saved successfully.
     mock_get_by_hash.return_value = None
+
     mock_create.return_value = {
         "id": 101,
         "filename": "processing_failure.txt",
@@ -89,8 +128,9 @@ def test_upload_keeps_file_when_processing_fails(
         "created_at": "2026-01-01T10:00:00",
     }
 
-    # Simulate an extraction or persistence error.
-    mock_process.side_effect = ValueError("Simulated processing failure")
+    mock_process.side_effect = ValueError(
+        "Simulated processing failure"
+    )
 
     response = client.post(
         "/documents/upload",
@@ -103,19 +143,17 @@ def test_upload_keeps_file_when_processing_fails(
         },
     )
 
-    # Upload succeeded even though subsequent processing failed.
     assert response.status_code == 201
     assert response.json()["id"] == 101
     assert response.json()["status"] == "failed"
 
-    # Preserve the file for investigation or a future retry.
-    stored_files = list(tmp_path.iterdir())
+    stored_files = get_stored_files(tmp_path)
+
     assert len(stored_files) == 1
     assert stored_files[0].read_bytes() == (
         b"document content for processing failure"
     )
 
-    # Confirm the processing service was invoked once.
     mock_process.assert_called_once()
 
 
@@ -123,7 +161,6 @@ def test_upload_keeps_file_when_processing_fails(
 def test_upload_duplicate_content_returns_conflict(mock_get_by_hash):
     """Identical content should return HTTP 409."""
 
-    # Simulate a matching document already recorded in the database.
     mock_get_by_hash.return_value = {"id": 12}
 
     response = client.post(
@@ -163,7 +200,9 @@ def test_upload_rejects_empty_file():
 
     response = client.post(
         "/documents/upload",
-        files={"file": ("empty.txt", b"", "text/plain")},
+        files={
+            "file": ("empty.txt", b"", "text/plain")
+        },
     )
 
     assert response.status_code == 400
@@ -173,7 +212,6 @@ def test_upload_rejects_empty_file():
 def test_upload_rejects_file_over_size_limit(mock_get_by_hash):
     """Files larger than the configured limit should be rejected."""
 
-    # Create a payload one byte larger than the 10 MiB limit.
     oversized_content = b"x" * (10 * 1024 * 1024 + 1)
 
     response = client.post(
@@ -188,8 +226,6 @@ def test_upload_rejects_file_over_size_limit(mock_get_by_hash):
     )
 
     assert response.status_code == 413
-
-    # Duplicate lookup should not run for an oversized upload.
     mock_get_by_hash.assert_not_called()
 
 
@@ -203,12 +239,16 @@ def test_upload_cleans_up_file_when_database_insert_fails(
 ):
     """A failed metadata insert should not leave an orphaned file."""
 
-    # Isolate the test from the application's normal storage directory.
-    monkeypatch.setattr("backend.routers.documents.STORAGE_DIR", tmp_path)
+    monkeypatch.setattr(
+        "backend.routers.documents.STORAGE_DIR",
+        tmp_path,
+    )
 
-    # Simulate a new document whose metadata insertion fails.
     mock_get_by_hash.return_value = None
-    mock_create.side_effect = RuntimeError("Simulated database failure")
+
+    mock_create.side_effect = RuntimeError(
+        "Simulated database failure"
+    )
 
     response = client.post(
         "/documents/upload",
@@ -221,9 +261,9 @@ def test_upload_cleans_up_file_when_database_insert_fails(
         },
     )
 
-    # Return a safe error message without exposing database internals.
     assert response.status_code == 500
-    assert response.json()["detail"] == "Failed to save uploaded document"
+    assert response.json()["detail"] == (
+        "Failed to save uploaded document"
+    )
 
-    # The file created by this request should be removed.
-    assert list(tmp_path.iterdir()) == []
+    assert get_stored_files(tmp_path) == []

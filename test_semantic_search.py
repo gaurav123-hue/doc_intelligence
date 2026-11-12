@@ -1,12 +1,15 @@
 
-"""Demonstrate semantic search from the command line."""
+"""Demonstrate session-scoped semantic search from the command line."""
 
 from backend.database import search_similar_chunks
 from backend.services.embedding import generate_embedding
 
 
 def main() -> None:
-    """Search stored document chunks and display the best matches."""
+    """Search document chunks belonging to a specific session."""
+
+    # Set the session ID containing the documents to search.
+    session_id = 999
 
     # Ask a sample question about the uploaded legal document.
     question = "What is the principle of fair trial?"
@@ -14,13 +17,18 @@ def main() -> None:
     # Convert the question into an embedding for semantic retrieval.
     query_embedding = generate_embedding(question)
 
-    # Retrieve the five most relevant chunks from PostgreSQL.
-    results = search_similar_chunks(query_embedding, limit=5)
+    # Retrieve the five most relevant chunks from this session only.
+    results = search_similar_chunks(
+        query_embedding,
+        session_id=session_id,
+        limit=5,
+    )
 
     print("\n" + "=" * 65)
-    print("         DOCUMENT  - SEMANTIC SEARCH")
+    print("         DOCUMENT - SEMANTIC SEARCH")
     print("=" * 65)
-    print(f"\nQuestion: {question}")
+    print(f"\nSession ID: {session_id}")
+    print(f"Question: {question}")
     print(f"Matching passages found: {len(results)}")
 
     # Display each result with its source metadata and a text preview.
@@ -34,7 +42,10 @@ def main() -> None:
         print(result["chunk_text"][:700])
 
     print("\n" + "=" * 65)
-    print("Search complete. These are retrieved passages, not AI-generated answers.")
+    print(
+        "Search complete. These are retrieved passages, "
+        "not AI-generated answers."
+    )
     print("=" * 65 + "\n")
 
 

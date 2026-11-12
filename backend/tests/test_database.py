@@ -5,6 +5,8 @@ from backend.database import (
     check_database_connection,
     create_document,
     get_documents,
+    save_conversation_turn,
+    get_conversation_history,
 )
 
 @patch("backend.database.psycopg.connect")
@@ -66,8 +68,12 @@ def test_create_document(mock_connect):
 
 
 
+
 @patch("backend.database.psycopg.connect")
 def test_get_documents(mock_connect):
+    """Documents should be retrieved only for the requested session."""
+
+    # Arrange: create a mocked database connection and cursor.
     mock_connection = MagicMock()
     mock_cursor = MagicMock()
 
@@ -75,22 +81,31 @@ def test_get_documents(mock_connect):
     mock_connection.__enter__.return_value = mock_connection
     mock_connection.cursor.return_value.__enter__.return_value = mock_cursor
 
+    # Simulate documents belonging to the requested session.
     mock_cursor.fetchall.return_value = [
         (1, "annual_report.pdf", "PDF", "pending", None),
         (2, "meeting_notes.txt", "TXT", "pending", None),
     ]
 
-    result = get_documents()
+    # Act: retrieve documents for session 999.
+    result = get_documents(session_id=999)
 
+    # Assert: verify the returned documents.
     assert len(result) == 2
     assert result[0]["filename"] == "annual_report.pdf"
     assert result[1]["filename"] == "meeting_notes.txt"
     assert result[0]["status"] == "pending"
 
+    # Verify the query filters documents by session ID.
     mock_cursor.execute.assert_called_once()
-    sql = mock_cursor.execute.call_args.args[0]
+
+    sql, parameters = mock_cursor.execute.call_args.args
+
     assert "SELECT" in sql
     assert "FROM documents" in sql
+    assert "WHERE session_id = %s" in sql
+    assert parameters == (999,)
+
 
 
 
@@ -157,38 +172,163 @@ from backend.database import search_similar_chunks
 
 
 
+
 @patch("backend.database.psycopg.connect")
 def test_search_similar_chunks_returns_ranked_results(mock_connect):
-    """Search should return chunk details, filename, and cosine distance."""
+    """Search should return ranked chunks from the requested session only."""
 
-    # Arrange: mock the database connection and its cursor.
+    # Arrange: create a mocked database connection and cursor.
     connection = MagicMock()
     cursor = MagicMock()
+
     mock_connect.return_value = connection
     connection.cursor.return_value.__enter__.return_value = cursor
 
-    # Simulate one matching chunk, including its parent document filename.
+    # Simulate one matching chunk belonging to the requested session.
     cursor.fetchall.return_value = [
         (12, 7, "case 01.PDF", 3, "The court examined the investigation.", 0.12)
     ]
 
-    # Act: search using a sample 384-dimensional query vector.
+    # Act: search using a sample embedding and session ID.
     query_embedding = [0.01] * 384
-    results = search_similar_chunks(query_embedding, limit=5)
+    session_id = 999
 
-    # Assert: verify all returned fields match the database row.
+    results = search_similar_chunks(
+        query_embedding,
+        session_id=session_id,
+        limit=5,
+    )
+
+    # Assert: verify all returned fields.
     assert len(results) == 1
     assert results[0]["chunk_id"] == 12
     assert results[0]["document_id"] == 7
     assert results[0]["filename"] == "case 01.PDF"
     assert results[0]["chunk_index"] == 3
-    assert results[0]["chunk_text"] == "The court examined the investigation."
+    assert results[0]["chunk_text"] == (
+        "The court examined the investigation."
+    )
     assert results[0]["distance"] == 0.12
 
-    # Verify cosine distance is used and values are parameterized.
+    # Verify the SQL filters documents by session ID.
     sql, parameters = cursor.execute.call_args.args
+
     assert "<=>" in sql
     assert "JOIN documents" in sql
+    assert "d.session_id = %s" in sql
     assert "ORDER BY" in sql
     assert "LIMIT" in sql
-    assert parameters == (str(query_embedding), str(query_embedding), 5)
+
+    assert parameters == (
+        str(query_embedding),
+        session_id,
+        str(query_embedding),
+        5,
+    )
+
+
+
+@patch("backend.database.psycopg.connect")
+def test_save_conversation_turn(mock_connect):
+    """Saving a conversation should persist its answer and metadata."""
+
+    # Arrange: configure the mocked database connection.
+    connection = MagicMock()
+    cursor = MagicMock()
+
+    mock_connect.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    cursor.fetchone.return_value = (15, None)
+
+    sources = [{"document_id": 7, "chunk_id": 59}]
+    cited_sources = [{"document_id": 7, "chunk_id": 59}]
+    citation_validation = {
+        "is_valid": True,
+        "cited_sources": cited_sources,
+        "invalid_sources": [],
+    }
+
+    # Act: save one conversation turn.
+    result = save_conversation_turn(
+        session_id=999,
+        question="What is a fair trial?",
+        answer="A fair trial protects individual rights.",
+        sources=sources,
+        cited_source_details=cited_sources,
+        citation_validation=citation_validation,
+        result_count=1,
+    )
+
+    # Assert: verify the generated database record.
+    assert result["id"] == 15
+    assert result["created_at"] is None
+
+    # Verify that the INSERT targets the correct table.
+    sql, parameters = cursor.execute.call_args.args
+
+    assert "INSERT INTO conversation_turns" in sql
+    assert "session_id" in sql
+    assert "question" in sql
+    assert "answer" in sql
+    assert "sources" in sql
+    assert "citation_validation" in sql
+
+    # Verify the session and question are passed correctly.
+    assert parameters[0] == 999
+    assert parameters[1] == "What is a fair trial?"
+    assert parameters[2] == "A fair trial protects individual rights."
+    assert parameters[6] == 1
+
+
+@patch("backend.database.psycopg.connect")
+def test_get_conversation_history(mock_connect):
+    """Conversation history should only include the requested session."""
+
+    # Arrange: configure the mocked database connection.
+    connection = MagicMock()
+    cursor = MagicMock()
+
+    mock_connect.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    # Simulate one previously saved conversation turn.
+    cursor.fetchall.return_value = [
+        (
+            15,
+            "What is a fair trial?",
+            "A fair trial protects individual rights.",
+            [{"document_id": 7, "chunk_id": 59}],
+            [{"document_id": 7, "chunk_id": 59}],
+            {
+                "is_valid": True,
+                "cited_sources": [
+                    {"document_id": 7, "chunk_id": 59}
+                ],
+                "invalid_sources": [],
+            },
+            1,
+            None,
+        )
+    ]
+
+    # Act: retrieve history for session 999.
+    result = get_conversation_history(session_id=999)
+
+    # Assert: verify the returned conversation.
+    assert len(result) == 1
+    assert result[0]["id"] == 15
+    assert result[0]["question"] == "What is a fair trial?"
+    assert result[0]["answer"] == (
+        "A fair trial protects individual rights."
+    )
+    assert result[0]["result_count"] == 1
+    assert result[0]["citation_validation"]["is_valid"] is True
+
+    # Verify that the query filters history by session ID.
+    sql, parameters = cursor.execute.call_args.args
+
+    assert "FROM conversation_turns" in sql
+    assert "WHERE session_id = %s" in sql
+    assert "ORDER BY created_at ASC" in sql
+    assert parameters == (999,)

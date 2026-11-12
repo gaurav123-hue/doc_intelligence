@@ -1,17 +1,23 @@
 
-"""Utilities for building prompts for retrieval-augmented generation."""
+"""Utilities for session-isolated retrieval-augmented generation."""
 
-# Reuse the existing vector search and embedding implementations.
+import re
+from typing import Any
+
+# Reuse the existing database vector-search implementation.
 from backend.database import search_similar_chunks
+
+# Reuse the existing embedding generation service.
 from backend.services.embedding import generate_embedding
 
-# Reuse the Groq language model service.
+# Reuse the existing Groq language model service.
 from backend.services.llm import generate_response
-from typing import Any
-# Use regular expressions to identify document and chunk citations.
-import re
 
-def build_rag_prompt(question: str, retrieved_chunks: list[dict[str, Any]]) -> str:
+
+def build_rag_prompt(
+    question: str,
+    retrieved_chunks: list[dict[str, Any]],
+) -> str:
     """Build a prompt containing retrieved document context and the question."""
 
     # Reject empty questions before constructing the prompt.
@@ -26,14 +32,14 @@ def build_rag_prompt(question: str, retrieved_chunks: list[dict[str, Any]]) -> s
     context_parts = []
 
     for chunk in retrieved_chunks:
-        # Include document and chunk identifiers so the model can reference sources.
+        # Include document and chunk identifiers for accurate citations.
         source = (
             f"Document ID: {chunk['document_id']}, "
             f"Chunk ID: {chunk['chunk_id']}, "
             f"Chunk Index: {chunk['chunk_index']}"
         )
 
-        # Add the actual extracted document text to the context.
+        # Add the extracted document text to the context.
         context_parts.append(
             f"[{source}]\n{chunk['chunk_text']}"
         )
@@ -41,7 +47,7 @@ def build_rag_prompt(question: str, retrieved_chunks: list[dict[str, Any]]) -> s
     # Combine all retrieved passages into one context section.
     context = "\n\n".join(context_parts)
 
-    # Instruct the model to answer only from the supplied document context.
+    # Instruct the model to answer exclusively from retrieved context.
     prompt = f"""
 You are an AI document assistant.
 
@@ -67,89 +73,121 @@ ANSWER:
     return prompt.strip()
 
 
-
 def validate_citations(
     answer: str,
     retrieved_chunks: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Check whether citations in the answer refer to retrieved chunks."""
+    """Check whether citations refer to chunks returned by retrieval."""
 
-    # Build a set of valid document/chunk combinations from retrieval results.
+    # Build valid document/chunk combinations from retrieval results.
     valid_sources = {
         (chunk["document_id"], chunk["chunk_id"])
         for chunk in retrieved_chunks
     }
 
-    
-    # Recognize both "Document ID: 7, Chunk ID: 59"
-    # and "Document 7, Chunk 59" citation formats.
+    # Recognize both supported citation formats.
     citation_pattern = re.compile(
         r"Document(?:\s+ID)?\s*:?\s*(\d+)\s*,\s*"
         r"Chunk(?:\s+ID)?\s*:?\s*(\d+)",
         re.IGNORECASE,
     )
 
-
     # Extract all citations from the generated answer.
     matches = citation_pattern.findall(answer)
 
-    # Convert the extracted identifiers into integer pairs.
+    # Convert extracted identifiers into integer pairs.
     cited_sources = {
         (int(document_id), int(chunk_id))
         for document_id, chunk_id in matches
     }
 
-    # Identify citations that do not exist in the retrieved source list.
+    # Identify citations that do not exist in retrieved results.
     invalid_sources = cited_sources - valid_sources
 
-    # Return validation details for use by the RAG pipeline.
     return {
-        "is_valid": len(cited_sources) > 0 and len(invalid_sources) == 0,
+        "is_valid": (
+            len(cited_sources) > 0
+            and len(invalid_sources) == 0
+        ),
         "cited_sources": [
-            {"document_id": document_id, "chunk_id": chunk_id}
+            {
+                "document_id": document_id,
+                "chunk_id": chunk_id,
+            }
             for document_id, chunk_id in sorted(cited_sources)
         ],
         "invalid_sources": [
-            {"document_id": document_id, "chunk_id": chunk_id}
+            {
+                "document_id": document_id,
+                "chunk_id": chunk_id,
+            }
             for document_id, chunk_id in sorted(invalid_sources)
         ],
     }
 
 
+def answer_question(
+    question: str,
+    session_id: int,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """Generate an answer using documents belonging to one session."""
 
-def answer_question(question: str, limit: int = 5) -> dict[str, Any]:
-    """Retrieve relevant document chunks and generate a grounded answer."""
+    # Reject empty questions before performing embedding generation.
+    if not question.strip():
+        raise ValueError("Question must not be empty")
+
+    # Ensure the session identifier is valid.
+    if session_id <= 0:
+        raise ValueError("Session ID must be a positive integer")
 
     # Convert the user's question into an embedding vector.
     query_embedding = generate_embedding(question)
 
-    # Retrieve the most relevant document chunks from PostgreSQL.
-    retrieved_chunks = search_similar_chunks(query_embedding, limit=limit)
+    # Retrieve relevant chunks ONLY from the authenticated session.
+    retrieved_chunks = search_similar_chunks(
+        query_embedding,
+        session_id=session_id,
+        limit=limit,
+    )
 
-    # Avoid generating an answer when no relevant passages are available.
+    # Avoid generating an answer when no relevant passages exist.
     if not retrieved_chunks:
         return {
             "question": question,
-            "answer": "I could not find relevant information in the uploaded documents.",
+            "answer": (
+                "I could not find relevant information "
+                "in the uploaded documents."
+            ),
             "sources": [],
+            "cited_source_details": [],
             "results_count": 0,
+            "citation_validation": {
+                "is_valid": False,
+                "cited_sources": [],
+                "invalid_sources": [],
+            },
         }
 
-    # Construct a prompt using the retrieved document passages.
+    # Construct a grounded prompt using retrieved document passages.
     prompt = build_rag_prompt(question, retrieved_chunks)
 
-    # Send the grounded prompt to Groq and obtain the generated answer.
+    # Send the prompt to Groq and generate the answer.
     answer = generate_response(prompt)
-    # Validate the citations generated by the LLM against retrieved chunks.
-    citation_validation = validate_citations(answer, retrieved_chunks)
 
-    # Build a set of document/chunk identifiers cited by the generated answer.
+    # Validate generated citations against retrieved chunks.
+    citation_validation = validate_citations(
+        answer,
+        retrieved_chunks,
+    )
+
+    # Build a set of document/chunk identifiers cited by the answer.
     cited_source_ids = {
         (source["document_id"], source["chunk_id"])
         for source in citation_validation["cited_sources"]
     }
 
-    # Match each citation to its complete retrieved source passage.
+    # Match citations to their complete retrieved source passages.
     cited_source_details = [
         {
             "document_id": chunk["document_id"],
@@ -160,37 +198,28 @@ def answer_question(question: str, limit: int = 5) -> dict[str, Any]:
             "distance": chunk["distance"],
         }
         for chunk in retrieved_chunks
-        if (chunk["document_id"], chunk["chunk_id"]) in cited_source_ids
+        if (
+            chunk["document_id"],
+            chunk["chunk_id"],
+        ) in cited_source_ids
     ]
 
-
-    # Return the answer together with its supporting source references.
+    # Return the answer and its supporting source references.
     return {
         "question": question,
         "answer": answer,
-        
         "sources": [
             {
-                # Identify the original document.
                 "document_id": chunk["document_id"],
                 "filename": chunk["filename"],
-
-                # Identify the exact passage within that document.
                 "chunk_id": chunk["chunk_id"],
                 "chunk_index": chunk["chunk_index"],
-
-                # Include the actual text used to generate the answer.
                 "chunk_text": chunk["chunk_text"],
-
-                # Preserve the semantic search distance.
                 "distance": chunk["distance"],
             }
             for chunk in retrieved_chunks
         ],
         "cited_source_details": cited_source_details,
-
         "results_count": len(retrieved_chunks),
-
-        # Report whether the LLM's citations match retrieved sources.
         "citation_validation": citation_validation,
     }

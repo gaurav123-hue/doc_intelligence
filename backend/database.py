@@ -1,12 +1,12 @@
 
-"""Database operations for document metadata."""
+"""Database operations for document metadata and session management."""
 
 import os
 from contextlib import closing
 
 import psycopg
 from dotenv import load_dotenv
-from psycopg import rows
+
 
 # Load local environment variables, including DATABASE_URL, from .env.
 load_dotenv()
@@ -22,20 +22,112 @@ def _get_database_url() -> str:
     return database_url
 
 
+class SessionDocumentLimitExceeded(Exception):
+    """Raised when a session has reached its maximum document limit."""
+
+
+# ---------------------------------------------------------------------------
+# Session operations
+# ---------------------------------------------------------------------------
+
+def create_session(token_hash: str) -> dict:
+    """Create a session using the SHA-256 hash of its secret token."""
+
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO sessions (token_hash)
+                    VALUES (%s)
+                    RETURNING id, created_at, last_activity_at
+                    """,
+                    (token_hash,),
+                )
+                row = cursor.fetchone()
+
+    return {
+        "id": row[0], # type: ignore
+        "created_at": row[1], # type: ignore
+        "last_activity_at": row[2], # type: ignore
+    }
+
+
+def get_active_session(token_hash: str) -> dict | None:
+    """Validate a session and refresh its activity timestamp.
+
+    Sessions inactive for 60 minutes are rejected and cannot be
+    reactivated simply by making another request.
+    """
+
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE sessions
+                    SET last_activity_at = CURRENT_TIMESTAMP
+                    WHERE token_hash = %s
+                      AND last_activity_at >=
+                          CURRENT_TIMESTAMP - INTERVAL '60 minutes'
+                    RETURNING id, created_at, last_activity_at
+                    """,
+                    (token_hash,),
+                )
+                row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "id": row[0],
+        "created_at": row[1],
+        "last_activity_at": row[2],
+    }
+
+
+def delete_session(session_id: int) -> bool:
+    """Delete a session and all associated database records.
+
+    Foreign-key ON DELETE CASCADE constraints automatically remove
+    documents, document contents, chunks, and conversation turns.
+    """
+
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM sessions
+                    WHERE id = %s
+                    RETURNING id
+                    """,
+                    (session_id,),
+                )
+                deleted_session = cursor.fetchone()
+
+    return deleted_session is not None
+
+
+# ---------------------------------------------------------------------------
+# General database operations
+# ---------------------------------------------------------------------------
+
 def check_database_connection() -> int:
     """Check database connectivity and return the result of SELECT 1."""
+
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
                 result = cursor.fetchone()
 
-    # SELECT 1 should always return one row containing the integer 1.
     return result[0] # type: ignore
 
 
 def create_document(filename: str, file_type: str) -> dict:
     """Insert document metadata and return the created record."""
+
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
@@ -58,21 +150,22 @@ def create_document(filename: str, file_type: str) -> dict:
     }
 
 
-def get_documents() -> list[dict]:
-    """Return all document records ordered by ID."""
-    with closing(psycopg.connect(_get_database_url())) as connection:
-        with connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT id, filename, file_type, status, created_at
-                    FROM documents
-                    ORDER BY id
-                    """
-                )
-                rows = cursor.fetchall()
+def get_documents(session_id: int) -> list[dict]:
+    """Return documents belonging to one session, ordered by ID."""
 
-    # Convert database tuples into dictionaries for the API layer.
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, filename, file_type, status, created_at
+                FROM documents
+                WHERE session_id = %s
+                ORDER BY id
+                """,
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+
     return [
         {
             "id": row[0],
@@ -85,22 +178,25 @@ def get_documents() -> list[dict]:
     ]
 
 
-def get_document_by_hash(content_hash: str) -> dict | None:
-    """Find a document by its SHA-256 content hash."""
-    with closing(psycopg.connect(_get_database_url())) as connection:
-        with connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT id, filename, file_type, status, created_at
-                    FROM documents
-                    WHERE content_hash = %s
-                    """,
-                    (content_hash,),
-                )
-                row = cursor.fetchone()
+def get_document_by_hash(
+    content_hash: str,
+    session_id: int,
+) -> dict | None:
+    """Find a duplicate document within the specified session."""
 
-    # A missing row means no matching document has been recorded.
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, filename, file_type, status, created_at
+                FROM documents
+                WHERE content_hash = %s
+                  AND session_id = %s
+                """,
+                (content_hash, session_id),
+            )
+            row = cursor.fetchone()
+
     if row is None:
         return None
 
@@ -117,18 +213,59 @@ def create_uploaded_document(
     filename: str,
     file_type: str | None,
     content_hash: str,
+    session_id: int,
 ) -> dict:
-    """Insert metadata for an uploaded document, including its content hash."""
+    """Insert a document while enforcing the three-file session limit."""
+
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
+
+                # Lock the session row to serialize uploads within this session.
                 cursor.execute(
                     """
-                    INSERT INTO documents (filename, file_type, content_hash)
-                    VALUES (%s, %s, %s)
+                    SELECT id
+                    FROM sessions
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (session_id,),
+                )
+                session = cursor.fetchone()
+
+                if session is None:
+                    raise ValueError("Session does not exist.")
+
+                # Count documents while holding the session lock.
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM documents
+                    WHERE session_id = %s
+                    """,
+                    (session_id,),
+                )
+                document_count = cursor.fetchone()[0] # type: ignore
+
+                # Reject uploads when the session already contains three documents.
+                if document_count >= 3:
+                    raise SessionDocumentLimitExceeded(
+                        "A session can contain a maximum of 3 documents."
+                    )
+
+                # Insert the document only after the limit check succeeds.
+                cursor.execute(
+                    """
+                    INSERT INTO documents (
+                        filename,
+                        file_type,
+                        content_hash,
+                        session_id
+                    )
+                    VALUES (%s, %s, %s, %s)
                     RETURNING id, filename, file_type, status, created_at
                     """,
-                    (filename, file_type, content_hash),
+                    (filename, file_type, content_hash, session_id),
                 )
                 row = cursor.fetchone()
 
@@ -141,9 +278,9 @@ def create_uploaded_document(
     }
 
 
-
 def save_extracted_text(document_id: int, extracted_text: str) -> None:
     """Save extracted text for a document, inserting or updating its content."""
+
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
@@ -163,10 +300,10 @@ def save_extracted_text(document_id: int, extracted_text: str) -> None:
 
 def update_document_status(document_id: int, status: str) -> None:
     """Update processing status for an existing document."""
+
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
-                # Parameterize values to keep SQL safe from injection.
                 cursor.execute(
                     """
                     UPDATE documents
@@ -176,7 +313,6 @@ def update_document_status(document_id: int, status: str) -> None:
                     (status, document_id),
                 )
 
-                # Fail explicitly if the requested document doesn't exist.
                 if cursor.rowcount == 0:
                     raise ValueError(
                         f"Document with ID {document_id} does not exist"
@@ -184,19 +320,15 @@ def update_document_status(document_id: int, status: str) -> None:
 
 
 def save_document_chunks(document_id: int, chunks: list[str]) -> None:
-    """Replace a document's stored chunks in a single database transaction."""
+    """Replace a document's stored chunks in a single transaction."""
 
-    # Reject empty input before connecting, so existing chunks are not deleted accidentally.
     if not chunks:
         raise ValueError("at least one chunk is required")
 
-    # Reject blank chunks before making any database changes.
     if any(not chunk.strip() for chunk in chunks):
         raise ValueError("chunks must not be empty or whitespace-only")
 
-    # Open a connection that will be closed even if the operation fails.
     with closing(psycopg.connect(_get_database_url())) as connection:
-        # The connection context commits on success and rolls back on error.
         with connection:
             with connection.cursor() as cursor:
                 # Remove previous chunks as part of the same transaction.
@@ -214,7 +346,6 @@ def save_document_chunks(document_id: int, chunks: list[str]) -> None:
                     for index, chunk in enumerate(chunks)
                 ]
 
-                # Insert the replacement chunks efficiently in one operation.
                 cursor.executemany(
                     """
                     INSERT INTO document_chunks
@@ -225,17 +356,16 @@ def save_document_chunks(document_id: int, chunks: list[str]) -> None:
                 )
 
 
-
-
+# ---------------------------------------------------------------------------
+# Embedding operations
+# ---------------------------------------------------------------------------
 
 def get_chunks_without_embeddings() -> list[dict]:
     """Return stored chunks that still need an embedding."""
 
-    # Reuse the database URL and connection pattern used by this module.
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
-                # Fetch only unprocessed chunks, in a predictable order.
                 cursor.execute(
                     """
                     SELECT id, chunk_text
@@ -246,7 +376,6 @@ def get_chunks_without_embeddings() -> list[dict]:
                 )
                 rows = cursor.fetchall()
 
-    # Return named fields so callers don't need to know tuple positions.
     return [
         {"id": row[0], "chunk_text": row[1]}
         for row in rows
@@ -256,11 +385,9 @@ def get_chunks_without_embeddings() -> list[dict]:
 def save_chunk_embedding(chunk_id: int, embedding: list[float]) -> None:
     """Save one generated vector to its corresponding chunk."""
 
-    # Validate the expected model output before sending it to PostgreSQL.
     if len(embedding) != 384:
         raise ValueError("Embedding must contain exactly 384 values")
 
-    # Update only the requested chunk and commit the change on success.
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
@@ -273,7 +400,6 @@ def save_chunk_embedding(chunk_id: int, embedding: list[float]) -> None:
                     (str(embedding), chunk_id),
                 )
 
-                # Avoid silently accepting an invalid chunk ID.
                 if cursor.rowcount == 0:
                     raise ValueError(
                         f"Document chunk with ID {chunk_id} does not exist"
@@ -281,29 +407,28 @@ def save_chunk_embedding(chunk_id: int, embedding: list[float]) -> None:
 
 
 
-
 def search_similar_chunks(
     query_embedding: list[float],
+    session_id: int,
     limit: int = 5,
 ) -> list[dict]:
-    """Return the most semantically similar document chunks."""
+    """Return the most similar chunks belonging to one session."""
 
-    # Validate the vector dimensions before querying pgvector.
+    # Validate the embedding dimensions expected by our vector column.
     if len(query_embedding) != 384:
         raise ValueError("Query embedding must contain exactly 384 values")
 
-    # Prevent invalid limits and unnecessarily large search results.
+    # Prevent invalid or excessively large search requests.
     if not 1 <= limit <= 50:
         raise ValueError("limit must be between 1 and 50")
 
-    # Use a database transaction and parameterized query for safe execution.
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
-                # Cosine distance ranks the nearest vectors first.
-                # Exclude chunks without embeddings.
+                # Filter through the parent document's session ID.
+                # This prevents chunks from other sessions appearing in results.
                 cursor.execute(
-                    """                  
+                    """
                     SELECT
                         dc.id,
                         dc.document_id,
@@ -313,17 +438,23 @@ def search_similar_chunks(
                         dc.embedding <=> %s::vector AS distance
                     FROM document_chunks dc
                     JOIN documents d ON d.id = dc.document_id
-                    WHERE dc.embedding IS NOT NULL
+                    WHERE
+                        dc.embedding IS NOT NULL
+                        AND d.session_id = %s
                     ORDER BY dc.embedding <=> %s::vector
                     LIMIT %s
-
                     """,
-                    (str(query_embedding), str(query_embedding), limit),
+                    (
+                        str(query_embedding),
+                        session_id,
+                        str(query_embedding),
+                        limit,
+                    ),
                 )
+
                 rows = cursor.fetchall()
 
-    
-# Convert database rows into named fields for the API layer.
+    # Convert database rows into dictionaries for the RAG pipeline.
     return [
         {
             "chunk_id": row[0],
@@ -336,3 +467,132 @@ def search_similar_chunks(
         for row in rows
     ]
 
+
+# ---------------------------------------------------------------------------
+# Session document cleanup operations
+# ---------------------------------------------------------------------------
+
+def get_session_documents(session_id: int) -> list[dict]:
+    """Retrieve document metadata belonging to one session.
+
+    The content hash and file type are used to reconstruct physical
+    storage paths during session cleanup.
+    """
+
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, filename, file_type, content_hash
+                FROM documents
+                WHERE session_id = %s
+                ORDER BY id
+                """,
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "filename": row[1],
+            "file_type": row[2],
+            "content_hash": row[3],
+        }
+        for row in rows
+    ]
+
+
+
+# ---------------------------------------------------------------------------
+# Conversation history operations
+# ---------------------------------------------------------------------------
+
+def save_conversation_turn(
+    session_id: int,
+    question: str,
+    answer: str,
+    sources: list[dict],
+    cited_source_details: list[dict],
+    citation_validation: dict,
+    result_count: int,
+) -> dict:
+    """Save a question, generated answer, and citation metadata."""
+
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                # Store the complete RAG response against its owning session.
+                cursor.execute(
+                    """
+                    INSERT INTO conversation_turns (
+                        session_id,
+                        question,
+                        answer,
+                        sources,
+                        cited_source_details,
+                        citation_validation,
+                        result_count
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s
+                    )
+                    RETURNING id, created_at
+                    """,
+                    (
+                        session_id,
+                        question,
+                        answer,
+                        psycopg.types.json.Jsonb(sources), # type: ignore
+                        psycopg.types.json.Jsonb(cited_source_details), # type: ignore
+                        psycopg.types.json.Jsonb(citation_validation), # type: ignore
+                        result_count,
+                    ),
+                )
+
+                row = cursor.fetchone()
+
+    return {
+        "id": row[0], # type: ignore
+        "created_at": row[1], # type: ignore
+    }
+
+
+def get_conversation_history(session_id: int) -> list[dict]:
+    """Retrieve conversation turns belonging to one session."""
+
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    question,
+                    answer,
+                    sources,
+                    cited_source_details,
+                    citation_validation,
+                    result_count,
+                    created_at
+                FROM conversation_turns
+                WHERE session_id = %s
+                ORDER BY created_at ASC, id ASC
+                """,
+                (session_id,),
+            )
+
+            rows = cursor.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "question": row[1],
+            "answer": row[2],
+            "sources": row[3],
+            "cited_source_details": row[4],
+            "citation_validation": row[5],
+            "result_count": row[6],
+            "created_at": row[7],
+        }
+        for row in rows
+    ]
