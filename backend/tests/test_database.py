@@ -150,3 +150,45 @@ def test_update_document_status_rejects_missing_document(mock_connect):
 
     with pytest.raises(ValueError, match="does not exist"):
         update_document_status(999999, "processed")
+
+
+
+from backend.database import search_similar_chunks
+
+
+
+@patch("backend.database.psycopg.connect")
+def test_search_similar_chunks_returns_ranked_results(mock_connect):
+    """Search should return chunk details, filename, and cosine distance."""
+
+    # Arrange: mock the database connection and its cursor.
+    connection = MagicMock()
+    cursor = MagicMock()
+    mock_connect.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    # Simulate one matching chunk, including its parent document filename.
+    cursor.fetchall.return_value = [
+        (12, 7, "case 01.PDF", 3, "The court examined the investigation.", 0.12)
+    ]
+
+    # Act: search using a sample 384-dimensional query vector.
+    query_embedding = [0.01] * 384
+    results = search_similar_chunks(query_embedding, limit=5)
+
+    # Assert: verify all returned fields match the database row.
+    assert len(results) == 1
+    assert results[0]["chunk_id"] == 12
+    assert results[0]["document_id"] == 7
+    assert results[0]["filename"] == "case 01.PDF"
+    assert results[0]["chunk_index"] == 3
+    assert results[0]["chunk_text"] == "The court examined the investigation."
+    assert results[0]["distance"] == 0.12
+
+    # Verify cosine distance is used and values are parameterized.
+    sql, parameters = cursor.execute.call_args.args
+    assert "<=>" in sql
+    assert "JOIN documents" in sql
+    assert "ORDER BY" in sql
+    assert "LIMIT" in sql
+    assert parameters == (str(query_embedding), str(query_embedding), 5)

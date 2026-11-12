@@ -6,6 +6,7 @@ from contextlib import closing
 
 import psycopg
 from dotenv import load_dotenv
+from psycopg import rows
 
 # Load local environment variables, including DATABASE_URL, from .env.
 load_dotenv()
@@ -30,7 +31,7 @@ def check_database_connection() -> int:
                 result = cursor.fetchone()
 
     # SELECT 1 should always return one row containing the integer 1.
-    return result[0]
+    return result[0] # type: ignore
 
 
 def create_document(filename: str, file_type: str) -> dict:
@@ -49,11 +50,11 @@ def create_document(filename: str, file_type: str) -> dict:
                 row = cursor.fetchone()
 
     return {
-        "id": row[0],
-        "filename": row[1],
-        "file_type": row[2],
-        "status": row[3],
-        "created_at": row[4],
+        "id": row[0], # type: ignore
+        "filename": row[1], # type: ignore
+        "file_type": row[2], # type: ignore
+        "status": row[3], # type: ignore
+        "created_at": row[4], # type: ignore
     }
 
 
@@ -132,11 +133,11 @@ def create_uploaded_document(
                 row = cursor.fetchone()
 
     return {
-        "id": row[0],
-        "filename": row[1],
-        "file_type": row[2],
-        "status": row[3],
-        "created_at": row[4],
+        "id": row[0], # type: ignore
+        "filename": row[1], # type: ignore
+        "file_type": row[2], # type: ignore
+        "status": row[3], # type: ignore
+        "created_at": row[4], # type: ignore
     }
 
 
@@ -222,3 +223,116 @@ def save_document_chunks(document_id: int, chunks: list[str]) -> None:
                     """,
                     chunk_rows,
                 )
+
+
+
+
+
+def get_chunks_without_embeddings() -> list[dict]:
+    """Return stored chunks that still need an embedding."""
+
+    # Reuse the database URL and connection pattern used by this module.
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                # Fetch only unprocessed chunks, in a predictable order.
+                cursor.execute(
+                    """
+                    SELECT id, chunk_text
+                    FROM document_chunks
+                    WHERE embedding IS NULL
+                    ORDER BY id
+                    """
+                )
+                rows = cursor.fetchall()
+
+    # Return named fields so callers don't need to know tuple positions.
+    return [
+        {"id": row[0], "chunk_text": row[1]}
+        for row in rows
+    ]
+
+
+def save_chunk_embedding(chunk_id: int, embedding: list[float]) -> None:
+    """Save one generated vector to its corresponding chunk."""
+
+    # Validate the expected model output before sending it to PostgreSQL.
+    if len(embedding) != 384:
+        raise ValueError("Embedding must contain exactly 384 values")
+
+    # Update only the requested chunk and commit the change on success.
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE document_chunks
+                    SET embedding = %s
+                    WHERE id = %s
+                    """,
+                    (str(embedding), chunk_id),
+                )
+
+                # Avoid silently accepting an invalid chunk ID.
+                if cursor.rowcount == 0:
+                    raise ValueError(
+                        f"Document chunk with ID {chunk_id} does not exist"
+                    )
+
+
+
+
+def search_similar_chunks(
+    query_embedding: list[float],
+    limit: int = 5,
+) -> list[dict]:
+    """Return the most semantically similar document chunks."""
+
+    # Validate the vector dimensions before querying pgvector.
+    if len(query_embedding) != 384:
+        raise ValueError("Query embedding must contain exactly 384 values")
+
+    # Prevent invalid limits and unnecessarily large search results.
+    if not 1 <= limit <= 50:
+        raise ValueError("limit must be between 1 and 50")
+
+    # Use a database transaction and parameterized query for safe execution.
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                # Cosine distance ranks the nearest vectors first.
+                # Exclude chunks without embeddings.
+                cursor.execute(
+                    """                  
+                    SELECT
+                        dc.id,
+                        dc.document_id,
+                        d.filename,
+                        dc.chunk_index,
+                        dc.chunk_text,
+                        dc.embedding <=> %s::vector AS distance
+                    FROM document_chunks dc
+                    JOIN documents d ON d.id = dc.document_id
+                    WHERE dc.embedding IS NOT NULL
+                    ORDER BY dc.embedding <=> %s::vector
+                    LIMIT %s
+
+                    """,
+                    (str(query_embedding), str(query_embedding), limit),
+                )
+                rows = cursor.fetchall()
+
+    
+# Convert database rows into named fields for the API layer.
+    return [
+        {
+            "chunk_id": row[0],
+            "document_id": row[1],
+            "filename": row[2],
+            "chunk_index": row[3],
+            "chunk_text": row[4],
+            "distance": float(row[5]),
+        }
+        for row in rows
+    ]
+
