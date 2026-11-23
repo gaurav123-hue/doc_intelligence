@@ -1,207 +1,147 @@
-# AI Document Intelligence
+# AI Document Intelligence Platform
 
-**An intelligent platform for understanding, searching, and interacting with documents using Artificial Intelligence.**
+An AI-powered document question-answering platform that allows users to upload documents, extract and process their content, and ask natural-language questions using Retrieval-Augmented Generation (RAG).
 
-AI Document Intelligence transforms static documents into interactive knowledge sources. Upload documents, extract information from text and visual content, and ask questions in natural language to receive accurate, context-aware answers backed by source citations.
+The platform combines semantic search, vector embeddings, and a Large Language Model (LLM) to generate context-aware answers grounded in uploaded documents.
 
-Built using modern AI technologies, Retrieval-Augmented Generation (RAG), multimodal document processing, and vector search, the platform makes complex document analysis faster, easier, and more accessible.
+## Project Overview
 
----
+AI Document Intelligence is designed to make information stored in documents easier to access and understand.
 
-## Overview
+Users can create a session, upload documents, and ask questions about their content. The application retrieves relevant document passages and uses them as context for generating answers. Responses include source references to help users trace the information back to the original documents.
 
-AI Document Intelligence is an end-to-end document intelligence platform that enables users to interact with their documents through an intelligent conversational interface.
+The current implementation focuses on the backend API, document processing, session management, and RAG-based question answering.
 
-The platform supports traditional text-based documents as well as scanned documents, images, diagrams, charts, and other visual content.
+## Key Features
 
-Instead of manually navigating lengthy documents, users can upload their files, ask questions, explore relevant information, and receive AI-generated answers with references to the original document pages and content.
+### Document Management
+- Upload PDF, DOCX, and TXT documents.
+- Maximum upload size of 10 MB per document.
+- Support for up to 3 documents per session.
+- SHA-256-based duplicate document detection within a session.
+- Extract and store document text.
+- Track document processing status.
+- Store uploaded files in session-specific directories.
 
-## Features
+### Document Processing
+- Extract selectable text from PDF files.
+- Extract paragraphs and tables from DOCX files.
+- Read text files using UTF-8 encoding.
+- Split extracted content into overlapping text chunks.
+- Generate vector embeddings for document chunks.
+- Store document content, chunks, and embeddings in PostgreSQL.
 
-### 1. Intelligent Document Management
-- Upload and manage multiple documents.
-- Support for PDF, DOCX, TXT, and image-based documents.
-- Document validation and duplicate detection.
-- Secure document storage and processing.
-- Document processing status and metadata management.
-- Session-based document organization.
-- Automatic document cleanup when sessions expire or end.
+### Retrieval-Augmented Generation (RAG)
+- Convert user questions into vector embeddings.
+- Retrieve semantically relevant document chunks.
+- Restrict retrieval to documents belonging to the authenticated session.
+- Use retrieved content as context for LLM responses.
+- Generate answers grounded in the available document content.
+- Validate that generated citations reference retrieved chunks.
+- Return source information alongside generated answers.
 
-### 2. Advanced Document Processing
-- Extract text from digital PDF documents.
-- Extract text from Word and text documents.
-- Extract images and visual elements from PDFs.
-- OCR processing for scanned PDFs and images.
-- Understand diagrams, charts, tables, and flowcharts.
-- Preserve page numbers and document references.
-- Combine extracted text and visual information into searchable content.
+### Session Management
+- Create secure, token-based user sessions.
+- Authenticate API requests using Bearer tokens.
+- Maintain isolated documents and conversations for each session.
+- Automatically expire sessions after 60 minutes of inactivity.
+- Run a background cleanup worker to identify and remove expired sessions.
+- Support explicit session termination.
+- Delete associated database records and uploaded files when a session ends.
 
-### 3. Multimodal Retrieval-Augmented Generation
-- Convert document content into vector embeddings.
-- Perform semantic search using PostgreSQL and pgvector.
-- Retrieve relevant passages and visual descriptions.
-- Combine textual and visual context.
-- Generate answers grounded in uploaded documents.
-- Provide source references and page-level citations.
-- Validate generated citations against retrieved sources.
-
-### 4. AI-Powered Question Answering
-- Ask questions using natural language.
-- Receive context-aware answers based on uploaded documents.
-- Search across multiple documents within a workspace.
-- Retrieve relevant supporting information.
-- Generate answers using large language models.
-- Maintain conversational context through stored conversation history.
-- Avoid relying on unsupported information outside retrieved document context.
-
-### 5. Session Management and Security
-- Secure session creation and authentication.
-- Cryptographically generated session tokens.
-- Hashed session-token storage.
-- Isolated document workspaces.
-- Session-based resource authorization.
-- Automatic session expiration after 60 minutes of inactivity.
-- Explicit session termination.
-- Background cleanup of expired sessions.
-- Removal of associated database records and uploaded files.
-
-### 6. Conversation History
-- Persistent conversation history.
-- Store user questions and AI-generated answers.
-- Preserve source references and citation metadata.
-- Retrieve previous conversations.
-- Maintain session-level conversation isolation.
-
-### 7. User Interface
-- Document upload interface.
-- Document library and processing status.
-- Interactive AI chat interface.
-- Source and citation previews.
-- Document page navigation.
-- Conversation history.
-- Session lifecycle management.
-- Responsive user experience.
-
----
+### Conversation History
+- Persist user questions and generated answers in PostgreSQL.
+- Store source information and citation metadata.
+- Retrieve conversation history for the authenticated session.
+- Preserve conversation history across API requests and application refreshes.
 
 ## Technology Stack
 
-| Layer | Technologies |
+| Component | Technology |
 |---|---|
-| Backend | Python, FastAPI |
-| Frontend | Modern web application framework |
-| Database | PostgreSQL |
-| Vector Database | PostgreSQL with pgvector |
-| Embeddings | Sentence Transformers |
-| Language Models | Groq-hosted LLMs |
-| Document Processing | PyMuPDF and document extraction libraries |
-| OCR | OCR processing engines |
-| Visual Understanding | Vision-capable AI models |
-| Authentication | Secure token-based sessions |
-| Testing | Pytest |
-| API Documentation | FastAPI Swagger UI |
-| Version Control | Git and GitHub |
+| Backend framework | FastAPI |
+| Programming language | Python 3.11 |
+| Database | PostgreSQL 17 |
+| Vector database extension | pgvector |
+| Embedding model | sentence-transformers/all-MiniLM-L6-v2 |
+| Embedding dimensions | 384 |
+| LLM provider | Groq |
+| Configured LLM | openai/gpt-oss-120b |
+| PDF extraction | pypdf |
+| DOCX extraction | python-docx |
+| API testing | pytest and FastAPI TestClient |
+| API documentation | Swagger UI |
 
 ## System Architecture
 
-The platform follows a modular architecture that separates the frontend, backend services, document-processing pipeline, AI services, and data-storage layer.
+The current application follows a modular backend architecture.
 
 ```text
-                  USER
-                    |
-                    v
-              FRONTEND
-                    |
-                    v
-              FASTAPI API
-                    |
-       +------------+------------+
-       |            |            |
-       v            v            v
-    SESSION      DOCUMENT     QUESTION
-   MANAGEMENT   MANAGEMENT   ANSWERING
-                    |
-                    v
-           DOCUMENT PROCESSING
-                    |
-          +---------+---------+
-          |                   |
-          v                   v
-      TEXT EXTRACTION      IMAGE EXTRACTION
-          |                   |
-          v                   v
-         OCR            VISUAL ANALYSIS
-          |                   |
-          +---------+---------+
-                    |
-                    v
-          UNIFIED DOCUMENT CONTENT
-                    |
-                    v
-             TEXT CHUNKING
-                    |
-                    v
-              EMBEDDINGS
-                    |
-                    v
-           POSTGRESQL + PGVECTOR
-                    |
-                    v
-             SEMANTIC SEARCH
-                    |
-                    v
-            CONTEXT RETRIEVAL
-                    |
-                    v
-                GROQ LLM
-                    |
-                    v
-          ANSWER + CITATIONS
-                    |
-                    v
-                FRONTEND
+                    Client
+                      |
+                      v
+                 FastAPI API
+                      |
+          +-----------+-----------+
+          |           |           |
+          v           v           v
+      Documents    Questions   Sessions
+       Router       Router      Router
+          |           |           |
+          v           v           v
+    Document       RAG Service  Session
+    Processing                  Management
+          |           |           |
+          v           v           v
+    Text Extraction  Semantic   Authentication
+    Text Chunking    Retrieval  and Cleanup
+          |           |
+          v           v
+       Embeddings   Groq LLM
+          |           |
+          +-----+-----+
+                |
+                v
+          PostgreSQL
+           + pgvector
 ```
 
-## How It Works
+### Document Processing Flow
 
-### Document Intelligence Pipeline
+1. A user uploads a supported document.
+2. The API validates the file format and size.
+3. The application calculates the document's SHA-256 hash.
+4. The document is stored in the authenticated session's storage directory.
+5. Text is extracted from the document.
+6. Extracted text is stored in PostgreSQL.
+7. The text is divided into overlapping chunks.
+8. Chunks are stored in PostgreSQL.
+9. Embeddings are generated and associated with the chunks.
+10. The document processing status is updated.
 
-1. The user uploads one or more documents.
-2. The backend validates the files and stores document metadata.
-3. Text, tables, and images are extracted from the documents.
-4. OCR processes scanned pages and image-based content.
-5. Vision models interpret relevant visual elements, including diagrams and charts.
-6. Extracted information is organized into searchable content with page references.
-7. Content is divided into manageable chunks.
-8. Embeddings are generated and stored in PostgreSQL using pgvector.
+### Question Answering Flow
 
-### Question Answering Pipeline
-
-1. The user submits a natural-language question.
+1. The user submits a question through the authenticated API.
 2. The question is converted into a vector embedding.
-3. Semantic search retrieves relevant document content.
-4. Relevant text passages and visual descriptions are assembled into context.
-5. The retrieved context is supplied to the language model.
-6. The model generates an answer grounded in the available document information.
-7. Citations are validated against retrieved sources.
-8. The answer, citations, and conversation metadata are stored.
-9. The frontend displays the answer with supporting document references.
-
----
+3. PostgreSQL and pgvector retrieve semantically relevant chunks.
+4. Retrieval is restricted to documents belonging to the current session.
+5. Retrieved passages are supplied to the Groq LLM as context.
+6. The LLM generates an answer using the supplied document content.
+7. Citation references are validated against the retrieved chunks.
+8. The answer, sources, and citation metadata are stored in conversation history.
+9. The API returns the answer and its supporting source information.
 
 ## Project Structure
 
 ```text
 ai-document-intelligence/
 │
-├── frontend/
-│   ├── src/
-│   ├── public/
-│   └── package.json
-│
 ├── backend/
 │   ├── main.py
 │   ├── database.py
+│   │
+│   ├── migrations/
+│   │   └── 001_create_sessions.sql
 │   │
 │   ├── routers/
 │   │   ├── documents.py
@@ -210,21 +150,22 @@ ai-document-intelligence/
 │   │
 │   ├── services/
 │   │   ├── document_processing.py
-│   │   ├── embedding.py
+│   │   ├── text_extraction.py
+│   │   ├── text_chunking.py
+│   │   ├── embeddings.py
 │   │   ├── llm.py
 │   │   ├── rag.py
 │   │   ├── sessions.py
 │   │   └── session_cleanup.py
 │   │
-│   ├── migrations/
 │   └── tests/
 │
 ├── storage/
 │   └── documents/
 │
-├── requirements.txt
-├── .env.example
+├── .env
 ├── .gitignore
+├── requirements.txt
 └── README.md
 ```
 
@@ -232,13 +173,11 @@ ai-document-intelligence/
 
 ### Prerequisites
 
-- Python 3.11 or later
-- Node.js and npm
-- PostgreSQL
-- pgvector extension
+- Python 3.11
+- PostgreSQL 17
+- pgvector PostgreSQL extension
+- Groq API key
 - Git
-- Groq API credentials
-- Required OCR and vision-model dependencies
 
 ### 1. Clone the Repository
 
@@ -248,172 +187,147 @@ git clone https://github.com/gaurav123-hue/doc_intelligence.git
 cd doc_intelligence
 ```
 
-### 2. Backend Setup
-
-Create and activate a virtual environment:
+### 2. Create a Virtual Environment
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 
 source .venv/bin/activate
 ```
 
-Install dependencies:
+### 3. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Frontend Setup
+### 4. Configure Environment Variables
 
-Install frontend dependencies:
-
-```bash
-cd frontend
-
-npm install
-```
-
-Start the frontend development server using the project's configured npm script.
-
-### 4. Environment Configuration
-
-Create a `.env` file in the backend project root or the location expected by the application.
-
-Configure the required environment variables:
+Create a `.env` file in the project root.
 
 ```env
+DATABASE_URL=postgresql://username:password@localhost:5432/ai_document_intelligence
+
 GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=your_configured_model
 
-DATABASE_URL=your_postgresql_connection_string
+GROQ_MODEL=openai/gpt-oss-120b
 ```
 
-Configure any additional OCR, vision-model, and storage settings required by the deployment.
+Replace the database credentials and API key with your own values.
 
-**Security:** Never commit `.env` files, API keys, database passwords, or other sensitive credentials.
+**Important:** Never commit `.env` or expose API keys and database credentials in source control.
 
-### 5. Database Setup
+### 5. Configure PostgreSQL
 
-Create the PostgreSQL database and enable pgvector:
+Create the application database and ensure the pgvector extension is installed and enabled.
 
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-```
+The database schema must include the application's document, content, chunk, session, and conversation-history tables.
 
-Apply the application's database migrations and initialize the required tables and indexes.
-
-### 6. Start the Backend
-
-From the project root:
+Apply the session migration:
 
 ```bash
-python -m uvicorn backend.main:app --reload
+psql "$DATABASE_URL" -f backend/migrations/001_create_sessions.sql
 ```
 
-Backend URL:
+Ensure the database role has the required permissions.
+
+### 6. Start the Backend Server
+
+Run the following command from the project root:
+
+```bash
+./.venv/bin/python -m uvicorn backend.main:app --reload
+```
+
+The API will be available at:
 
 ```text
 http://127.0.0.1:8000
 ```
 
-### 7. API Documentation
+### 7. Access API Documentation
 
-Interactive API documentation:
+FastAPI provides interactive API documentation through Swagger UI.
 
 ```text
 http://127.0.0.1:8000/docs
 ```
 
-Alternative documentation:
-
-```text
-http://127.0.0.1:8000/redoc
-```
-
----
-
-## API Overview
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/sessions/start` | POST | Create a new session |
-| `/sessions/end` | POST | Terminate a session |
-| `/documents/upload` | POST | Upload a document |
-| `/documents` | GET | List session documents |
-| `/questions/preview` | POST | Preview retrieved context |
-| `/questions/ask` | POST | Ask a document-related question |
-| `/questions/history` | GET | Retrieve conversation history |
-| `/health` | GET | Check API health |
-
-Authenticated requests use Bearer token authentication.
-
-```http
-Authorization: Bearer YOUR_SESSION_TOKEN
-```
-
-Refer to the interactive API documentation for complete request and response schemas.
-
----
-
-## Database Architecture
-
-PostgreSQL serves as the primary relational database, while pgvector provides efficient vector similarity search.
-
-The database manages:
-
-- User session information.
-- Document metadata and ownership.
-- Extracted document content.
-- Document chunks.
-- Vector embeddings.
-- Conversation history.
-- Citation metadata.
-
-Session-based relationships and database constraints maintain data isolation and support reliable cleanup.
-
-## Security and Reliability
-
-The platform incorporates:
-
-- Secure random session-token generation.
-- SHA-256 hashing of session tokens.
-- Session-based authorization.
-- Resource ownership validation.
-- Database transaction management.
-- Foreign-key cascade deletion.
-- Safe filesystem path validation.
-- Automatic inactivity expiration.
-- Background cleanup processing.
-- Automated application tests.
-- Structured application logging.
+Use Swagger UI to explore and test the available API endpoints.
 
 ## Testing
 
-The backend uses Pytest for automated testing.
+The project uses pytest for automated testing.
 
-Run the test suite:
+Run the complete test suite:
 
 ```bash
-python -m pytest -q
+./.venv/bin/python -m pytest -q
 ```
 
-Tests cover document processing, database operations, API endpoints, semantic retrieval, citation validation, session authentication, conversation history, and cleanup operations.
+The tests cover areas including:
 
-## License
+- Document upload and validation.
+- Duplicate document detection.
+- Document processing.
+- Text extraction and chunking.
+- Database operations.
+- Embedding and retrieval functionality.
+- RAG citation validation.
+- Question-answering endpoints.
+- Session authentication and isolation.
+- Conversation history.
+- Manual and automatic session cleanup.
 
-This project is distributed under the license specified in the repository.
+## Security and Data Isolation
+
+The application uses session-based authentication to isolate user data.
+
+- Session tokens are generated using secure random token generation.
+- Only token hashes are stored in the database.
+- Authenticated API requests require a valid Bearer token.
+- Document retrieval is restricted to the active session.
+- Conversation history is session-specific.
+- Session termination removes associated database records and uploaded files.
+- Automatic expiration prevents inactive sessions from remaining indefinitely.
+
+## Current Limitations
+
+The current implementation primarily supports text-based document intelligence.
+
+The following capabilities are not yet implemented:
+
+- OCR for scanned PDFs and images.
+- Extraction of embedded images from PDF documents.
+- Understanding charts, diagrams, and flowcharts.
+- Page-level source references.
+- Multimodal document retrieval and question answering.
+- A frontend user interface.
+- Production deployment and monitoring.
+
+## Future Development
+
+Planned enhancements include:
+
+1. OCR and scanned document processing.
+2. PDF image extraction and visual content analysis.
+3. Chart, diagram, and flowchart understanding.
+4. Page-aware document extraction and citations.
+5. Multimodal Retrieval-Augmented Generation.
+6. Frontend development with document upload, library, chat, and source previews.
+7. Full frontend and backend integration.
+8. Production deployment, security hardening, and performance optimization.
+
+## Project Goal
+
+The long-term goal is to build a complete AI-powered document intelligence platform that can understand, retrieve, and answer questions from both textual and visual information contained in documents.
+
+The platform aims to make large collections of documents easier to explore through natural-language interaction while maintaining reliable, traceable, and context-grounded answers.
 
 ---
 
-## Author
+**Project:** AI Document Intelligence Platform
 
-**AI Document Intelligence**
+**Repository:** https://github.com/gaurav123-hue/doc_intelligence.git
 
-GitHub: [gaurav123-hue](https://github.com/gaurav123-hue)
-
-Repository: [doc_intelligence](https://github.com/gaurav123-hue/doc_intelligence)
-
----
-
-*Transforming documents into intelligent, searchable, and conversational knowledge.*
+**Status:** Backend foundation and core RAG functionality implemented; frontend and advanced document intelligence capabilities are planned.
