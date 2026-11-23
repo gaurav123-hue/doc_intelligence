@@ -7,6 +7,7 @@ from backend.database import (
     get_documents,
     save_conversation_turn,
     get_conversation_history,
+    delete_session,
 )
 
 @patch("backend.database.psycopg.connect")
@@ -332,3 +333,76 @@ def test_get_conversation_history(mock_connect):
     assert "WHERE session_id = %s" in sql
     assert "ORDER BY created_at ASC" in sql
     assert parameters == (999,)
+
+
+
+@patch("backend.database.psycopg.connect")
+def test_delete_session_returns_document_metadata(mock_connect):
+    """Deleting a session should return metadata for its uploaded files."""
+
+    # Arrange: configure the mocked database connection and cursor.
+    connection = MagicMock()
+    cursor = MagicMock()
+
+    mock_connect.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    # Simulate an existing session.
+    cursor.fetchone.side_effect = [
+        (999,),  # Session found by SELECT ... FOR UPDATE.
+        (999,),  # Session deleted successfully.
+    ]
+
+    # Simulate two documents belonging to the session.
+    cursor.fetchall.return_value = [
+        (1, "report.pdf", "PDF", "abc123"),
+        (2, "notes.txt", "TXT", "def456"),
+    ]
+
+    # Act: delete session 999.
+    result = delete_session(session_id=999)
+
+    # Assert: verify the returned session metadata.
+    assert result["session_id"] == 999 # type: ignore
+    assert len(result["documents"]) == 2 # type: ignore
+    assert result["documents"][0]["filename"] == "report.pdf" # type: ignore
+    assert result["documents"][0]["content_hash"] == "abc123" # type: ignore
+    assert result["documents"][1]["filename"] == "notes.txt" # type: ignore
+    assert result["documents"][1]["content_hash"] == "def456" # type: ignore
+
+    # Verify that the session row was locked before deletion.
+    executed_queries = [
+        call.args[0] for call in cursor.execute.call_args_list
+    ]
+
+    assert "FOR UPDATE" in executed_queries[0]
+    assert "FROM documents" in executed_queries[1]
+    assert "DELETE FROM sessions" in executed_queries[2]
+
+
+@patch("backend.database.psycopg.connect")
+def test_delete_session_returns_none_when_missing(mock_connect):
+    """Deleting a nonexistent session should return None."""
+
+    # Arrange: configure the mocked database connection.
+    connection = MagicMock()
+    cursor = MagicMock()
+
+    mock_connect.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    # Simulate a session that does not exist.
+    cursor.fetchone.return_value = None
+
+    # Act: attempt to delete the nonexistent session.
+    result = delete_session(session_id=999999)
+
+    # Assert: no session should be returned or deleted.
+    assert result is None
+
+    # Verify that only the session lookup was executed.
+    cursor.execute.assert_called_once()
+
+    sql = cursor.execute.call_args.args[0]
+    assert "FOR UPDATE" in sql
+    

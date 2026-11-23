@@ -9,7 +9,7 @@ from backend.database import (
     create_session,
     get_active_session,
     delete_session,
-    get_session_documents
+    
 )
 
 # Keep cleanup errors in server logs for troubleshooting.
@@ -54,15 +54,27 @@ def validate_session(token: str) -> dict | None:
 
     return get_active_session(token_hash)
 
-def end_session(session_id: int) -> bool:
-    """Delete a session, its database records, and uploaded files."""
 
-    # Retrieve only documents owned by the session being terminated.
-    documents = get_session_documents(session_id)
 
-    # Reconstruct and validate each physical storage path.
-    file_paths = []
 
+def _remove_session_files(
+    session_id: int,
+    documents: list[dict],
+) -> None:
+    """Remove uploaded files and the storage directory for one session."""
+
+    # Build the storage directory belonging to this session.
+    session_storage_dir = (STORAGE_DIR / str(session_id)).resolve()
+
+    # Ensure the directory cannot escape the main storage directory.
+    if session_storage_dir.parent != STORAGE_DIR:
+        logger.error(
+            "Unsafe session storage directory: %s",
+            session_storage_dir,
+        )
+        return
+
+    # Remove only files registered to this session.
     for document in documents:
         content_hash = document["content_hash"]
         file_type = document["file_type"]
@@ -70,31 +82,72 @@ def end_session(session_id: int) -> bool:
         if not content_hash or not file_type:
             continue
 
-        # The original upload process uses the lowercase extension.
+        # Reconstruct the expected uploaded file path.
         extension = f".{file_type.lower()}"
-        file_path = (STORAGE_DIR / f"{content_hash}{extension}").resolve()
+        file_path = (
+            session_storage_dir / f"{content_hash}{extension}"
+        ).resolve()
 
-        # Prevent any path outside the document storage directory.
-        if file_path.parent != STORAGE_DIR:
+        # Prevent deletion of files outside this session directory.
+        if file_path.parent != session_storage_dir:
             logger.warning("Skipping unsafe storage path: %s", file_path)
             continue
 
-        file_paths.append(file_path)
-
-    # Delete the database session first. Foreign-key cascades remove
-    # its documents, extracted contents, chunks, and conversation history.
-    deleted = delete_session(session_id)
-
-    if not deleted:
-        return False
-
-    # Remove physical files after the database transaction succeeds.
-    for file_path in file_paths:
         try:
             file_path.unlink(missing_ok=True)
         except OSError:
-            # Log failures so orphaned files can be handled by cleanup later.
-            logger.exception("Could not remove session file: %s", file_path)
+            logger.exception(
+                "Could not remove session file: %s",
+                file_path,
+            )
+
+    # Remove the session directory when it is empty.
+    try:
+        session_storage_dir.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning(
+            "Session storage directory could not be removed: %s",
+            session_storage_dir,
+        )
+
+
+def end_session(session_id: int) -> bool:
+    """Delete a session, its database records, and uploaded files."""
+
+    # Delete database records and retrieve file metadata atomically.
+    deleted_session = delete_session(session_id)
+
+    if deleted_session is None:
+        return False
+
+    # Reuse the shared physical-file cleanup implementation.
+    _remove_session_files(
+        session_id,
+        deleted_session["documents"],
+    )
+
+    return True
+
+
+def end_expired_session(session_id: int) -> bool:
+    """Delete a session only if it is still expired."""
+
+    # Recheck expiry while acquiring the database session row lock.
+    deleted_session = delete_session(
+        session_id,
+        only_if_expired=True,
+    )
+
+    if deleted_session is None:
+        return False
+
+    # Remove the physical files belonging to the expired session.
+    _remove_session_files(
+        session_id,
+        deleted_session["documents"],
+    )
 
     return True
 

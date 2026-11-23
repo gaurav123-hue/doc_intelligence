@@ -86,16 +86,79 @@ def get_active_session(token_hash: str) -> dict | None:
     }
 
 
-def delete_session(session_id: int) -> bool:
-    """Delete a session and all associated database records.
+def get_expired_session_ids() -> list[int]:
+    """Return IDs of sessions inactive for more than 60 minutes."""
 
-    Foreign-key ON DELETE CASCADE constraints automatically remove
-    documents, document contents, chunks, and conversation turns.
+    with closing(psycopg.connect(_get_database_url())) as connection:
+        with connection:
+            with connection.cursor() as cursor:
+                # Identify sessions that have exceeded the inactivity limit.
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM sessions
+                    WHERE last_activity_at <
+                        CURRENT_TIMESTAMP - INTERVAL '60 minutes'
+                    ORDER BY last_activity_at ASC
+                    """
+                )
+
+                rows = cursor.fetchall()
+
+    # Return only session IDs for the cleanup service.
+    return [row[0] for row in rows]
+
+
+def delete_session(
+    session_id: int,
+    only_if_expired: bool = False,
+) -> dict | None:
+    """Atomically delete a session and return its uploaded document metadata.
+
+    The session row lock prevents concurrent uploads from registering
+    new documents while the session is being deleted.
     """
 
     with closing(psycopg.connect(_get_database_url())) as connection:
         with connection:
             with connection.cursor() as cursor:
+
+                # Lock the session row to serialize deletion with uploads.
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM sessions
+                    WHERE id = %s
+                      AND (
+                          %s = FALSE
+                          OR last_activity_at <
+                              CURRENT_TIMESTAMP - INTERVAL '60 minutes'
+                      )
+                    FOR UPDATE
+                    """,
+                    (session_id, only_if_expired),
+)
+
+                session = cursor.fetchone()
+
+                # Return None when the session does not exist.
+                if session is None:
+                    return None
+
+                # Capture file metadata before cascading database deletion.
+                cursor.execute(
+                    """
+                    SELECT id, filename, file_type, content_hash
+                    FROM documents
+                    WHERE session_id = %s
+                    ORDER BY id
+                    """,
+                    (session_id,),
+                )
+
+                document_rows = cursor.fetchall()
+
+                # Delete the session and its related database records.
                 cursor.execute(
                     """
                     DELETE FROM sessions
@@ -104,9 +167,23 @@ def delete_session(session_id: int) -> bool:
                     """,
                     (session_id,),
                 )
+
                 deleted_session = cursor.fetchone()
 
-    return deleted_session is not None
+    # Return document metadata so the service can remove physical files.
+    return {
+        "session_id": deleted_session[0], # type: ignore
+        "documents": [
+            {
+                "id": row[0],
+                "filename": row[1],
+                "file_type": row[2],
+                "content_hash": row[3],
+            }
+            for row in document_rows
+        ],
+    }
+
 
 
 # ---------------------------------------------------------------------------
